@@ -1,12 +1,12 @@
-"""Graph builder: walks a repo, parses Python files, persists to Neo4j."""
+"""Graph builder: walks a repo, parses Python files, persists to graph DB."""
 
 import hashlib
 import logging
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 
-from ..core.graph_db import GraphDB
 from .ast_parser import FileInfo, parse_file
 
 logger = logging.getLogger(__name__)
@@ -50,8 +50,11 @@ def _hash_file(path: Path) -> str:
 # Incremental diff
 # ------------------------------------------------------------------
 
-def _get_indexed_hashes(db: GraphDB) -> Dict[str, str]:
-    """Query Neo4j for all File nodes and their content_hash."""
+def _get_indexed_hashes(db) -> Dict[str, str]:
+    """Query graph for all File nodes and their content_hash."""
+    if hasattr(db, "get_all_file_hashes"):
+        return db.get_all_file_hashes()
+    # Neo4j fallback
     with db.session() as session:
         result = db.run_query(session, """
             MATCH (f:File)
@@ -95,43 +98,50 @@ def _compute_diff(
     return new_or_changed, unchanged, deleted
 
 
-def _delete_file_subgraph(db: GraphDB, deleted_paths: List[str]) -> int:
+def _delete_file_subgraph(db, deleted_paths: List[str]) -> int:
     """Remove nodes and edges for deleted files."""
     if not deleted_paths:
         return 0
-    with db.session() as session:
-        # Delete all nodes that belong to these files, plus the file nodes themselves
-        result = db.run_query(session, """
-            UNWIND $paths AS p
-            MATCH (f:File {path: p})-[:CONTAINS]->(n)
-            DETACH DELETE n
-            WITH count(*) AS child_count
-            UNWIND $paths AS p
-            MATCH (f:File {path: p})
-            DETACH DELETE f
-            RETURN child_count
-        """, paths=deleted_paths)
+    if hasattr(db, "delete_file_subgraph"):
+        db.delete_file_subgraph(deleted_paths)
+    else:
+        with db.session() as session:
+            db.run_query(session, """
+                UNWIND $paths AS p
+                MATCH (f:File {path: p})-[:CONTAINS]->(n)
+                DETACH DELETE n
+                WITH count(*) AS child_count
+                UNWIND $paths AS p
+                MATCH (f:File {path: p})
+                DETACH DELETE f
+                RETURN child_count
+            """, paths=deleted_paths)
     logger.info("Deleted subgraphs for %d removed files", len(deleted_paths))
     return len(deleted_paths)
 
 
-def _delete_stale_nodes(db: GraphDB, changed_rel_paths: List[str]) -> None:
+def _delete_stale_nodes(db, changed_rel_paths: List[str]) -> None:
     """Remove old child nodes for files that will be re-indexed."""
     if not changed_rel_paths:
         return
-    with db.session() as session:
-        db.run_query(session, """
-            UNWIND $paths AS p
-            MATCH (f:File {path: p})-[:CONTAINS]->(n)
-            DETACH DELETE n
-        """, paths=changed_rel_paths)
+    if hasattr(db, "delete_file_subgraph"):
+        # NetworkX: delete children but keep File node (subgraph deletes file too,
+        # but it will be re-merged during persist)
+        db.delete_file_subgraph(changed_rel_paths)
+    else:
+        with db.session() as session:
+            db.run_query(session, """
+                UNWIND $paths AS p
+                MATCH (f:File {path: p})-[:CONTAINS]->(n)
+                DETACH DELETE n
+            """, paths=changed_rel_paths)
 
 
 # ------------------------------------------------------------------
 # Public API
 # ------------------------------------------------------------------
 
-def build_graph(repo_path: Path, db: GraphDB, force: bool = False) -> Dict[str, Any]:
+def build_graph(repo_path: Path, db, force: bool = False) -> Dict[str, Any]:
     """Index a repository into the Neo4j graph.
 
     Incremental by default: only re-parses new/changed files and removes
@@ -231,8 +241,8 @@ def _parse_files(python_files: List[Path], repo_path: Path, workers: int) -> Lis
     return results
 
 
-def _persist_to_graph(file_infos: List[FileInfo], repo_path: Path, db: GraphDB) -> Dict[str, int]:
-    """Persist parsed file info to Neo4j using UNWIND batches."""
+def _persist_to_graph(file_infos: List[FileInfo], repo_path: Path, db) -> Dict[str, int]:
+    """Persist parsed file info to graph DB."""
     files_data = []
     functions_data = []
     classes_data = []
@@ -262,6 +272,7 @@ def _persist_to_graph(file_infos: List[FileInfo], repo_path: Path, db: GraphDB) 
                 "signature": func.signature,
                 "docstring": func.docstring,
                 "qualified_name": f"{mod}.{func.name}",
+                "calls": func.calls or [],
             })
             contains_data.append({"file_path": fi.relative_path, "node_id": func_id, "node_type": "Function"})
 
@@ -295,6 +306,16 @@ def _persist_to_graph(file_infos: List[FileInfo], repo_path: Path, db: GraphDB) 
 
             for method in cls.methods:
                 method_id = f"{fi.relative_path}::{cls.name}.{method.name}:{method.start_line}"
+
+                # Resolve self./cls. references to ClassName.method for
+                # accurate CALLS edge matching and test linking.
+                resolved_calls = []
+                for call in method.calls:
+                    if call.startswith("self.") or call.startswith("cls."):
+                        resolved_calls.append(f"{cls.name}.{call.split('.', 1)[1]}")
+                    else:
+                        resolved_calls.append(call)
+
                 functions_data.append({
                     "id": method_id,
                     "name": f"{cls.name}.{method.name}",
@@ -304,6 +325,7 @@ def _persist_to_graph(file_infos: List[FileInfo], repo_path: Path, db: GraphDB) 
                     "signature": method.signature,
                     "docstring": method.docstring,
                     "qualified_name": f"{mod}.{cls.name}.{method.name}",
+                    "calls": resolved_calls,
                 })
                 contains_data.append({"file_path": fi.relative_path, "node_id": method_id, "node_type": "Function"})
 
@@ -316,91 +338,125 @@ def _persist_to_graph(file_infos: List[FileInfo], repo_path: Path, db: GraphDB) 
                     })
                     contains_data.append({"file_path": fi.relative_path, "node_id": test_id, "node_type": "Test"})
 
-                for call in method.calls:
+                for call in resolved_calls:
                     calls_data.append({"caller_id": method_id, "callee_name": call})
 
         # File-level import edges
         for imp in fi.imports:
             imports_data.append({"importer": fi.relative_path, "imported_module": imp})
 
-    # -- Write to Neo4j with UNWIND batches --
-    with db.session() as session:
-        # Nodes
-        if files_data:
-            db.run_query(session, """
-                UNWIND $rows AS r
-                MERGE (f:File {path: r.path})
-                SET f.name = r.name, f.content_hash = r.content_hash,
-                    f.repo_path = r.repo_path, f.updated_at = datetime()
-            """, rows=files_data)
+    # Resolve CALLS, IMPORTS, and INHERITS edges in Python using dict lookups.
+    # This replaces O(rows × nodes) Cypher cross-product scans with O(1) per lookup.
+    resolved_calls = _resolve_calls(calls_data, functions_data)
+    resolved_imports = _resolve_imports(imports_data, files_data)
+    resolved_inherits = _resolve_inherits(inherits_data, classes_data)
 
-        if functions_data:
-            db.run_query(session, """
-                UNWIND $rows AS r
-                MERGE (fn:Function {id: r.id})
-                SET fn.name = r.name, fn.file_path = r.file_path,
-                    fn.start_line = r.start_line, fn.end_line = r.end_line,
-                    fn.signature = r.signature, fn.docstring = r.docstring,
-                    fn.qualified_name = r.qualified_name, fn.updated_at = datetime()
-            """, rows=functions_data)
+    logger.info(
+        "Edge resolution: %d/%d calls, %d/%d imports, %d/%d inherits resolved",
+        len(resolved_calls), len(calls_data),
+        len(resolved_imports), len(imports_data),
+        len(resolved_inherits), len(inherits_data),
+    )
 
-        if classes_data:
-            db.run_query(session, """
-                UNWIND $rows AS r
-                MERGE (c:Class {id: r.id})
-                SET c.name = r.name, c.file_path = r.file_path,
-                    c.start_line = r.start_line, c.end_line = r.end_line,
-                    c.docstring = r.docstring, c.qualified_name = r.qualified_name,
-                    c.updated_at = datetime()
-            """, rows=classes_data)
+    # -- Write to graph DB --
+    if hasattr(db, "merge_nodes"):
+        # NetworkX backend
+        db.merge_nodes("File", files_data, "path")
+        db.merge_nodes("Function", functions_data, "id")
+        db.merge_nodes("Class", classes_data, "id")
+        db.merge_nodes("Test", tests_data, "id")
 
-        if tests_data:
-            db.run_query(session, """
-                UNWIND $rows AS r
-                MERGE (t:Test {id: r.id})
-                SET t.name = r.name, t.file_path = r.file_path, t.updated_at = datetime()
-            """, rows=tests_data)
+        # CONTAINS edges
+        for row in contains_data:
+            src = f"File::{row['file_path']}"
+            dst = f"{row['node_type']}::{row['node_id']}"
+            db.merge_edge(src, dst, "CONTAINS")
 
-        # Edges: CONTAINS
-        if contains_data:
-            db.run_query(session, """
-                UNWIND $rows AS r
-                MATCH (f:File {path: r.file_path})
-                MATCH (n {id: r.node_id})
-                MERGE (f)-[:CONTAINS]->(n)
-            """, rows=contains_data)
+        # CALLS edges (pre-resolved)
+        for row in resolved_calls:
+            db.merge_edge(f"Function::{row['caller_id']}", f"Function::{row['callee_id']}", "CALLS")
 
-        # Edges: CALLS (resolve callee by name)
-        if calls_data:
-            db.run_query(session, """
-                UNWIND $rows AS r
-                MATCH (caller:Function {id: r.caller_id})
-                MATCH (callee:Function)
-                WHERE callee.name = r.callee_name OR callee.qualified_name ENDS WITH ('.' + r.callee_name)
-                MERGE (caller)-[:CALLS]->(callee)
-            """, rows=calls_data)
+        # IMPORTS edges (pre-resolved)
+        for row in resolved_imports:
+            db.merge_edge(f"File::{row['importer']}", f"File::{row['imported']}", "IMPORTS")
 
-        # Edges: IMPORTS (file → file via module name)
-        if imports_data:
-            db.run_query(session, """
-                UNWIND $rows AS r
-                MATCH (importer:File {path: r.importer})
-                MATCH (imported:File)
-                WHERE replace(replace(imported.path, '/', '.'), '.py', '') ENDS WITH r.imported_module
-                MERGE (importer)-[:IMPORTS]->(imported)
-            """, rows=imports_data)
+        # INHERITS edges (pre-resolved)
+        for row in resolved_inherits:
+            db.merge_edge(f"Class::{row['class_id']}", f"Class::{row['parent_id']}", "INHERITS")
 
-        # Edges: INHERITS (class → class by name)
-        if inherits_data:
-            db.run_query(session, """
-                UNWIND $rows AS r
-                MATCH (child:Class {id: r.class_id})
-                MATCH (parent:Class)
-                WHERE parent.name = r.base_name
-                MERGE (child)-[:INHERITS]->(parent)
-            """, rows=inherits_data)
+        db.save()
+    else:
+        # Neo4j backend
+        with db.session() as session:
+            if files_data:
+                db.run_query(session, """
+                    UNWIND $rows AS r
+                    MERGE (f:File {path: r.path})
+                    SET f.name = r.name, f.content_hash = r.content_hash,
+                        f.repo_path = r.repo_path, f.updated_at = datetime()
+                """, rows=files_data)
 
-    edges = len(contains_data) + len(calls_data) + len(imports_data) + len(inherits_data)
+            if functions_data:
+                db.run_query(session, """
+                    UNWIND $rows AS r
+                    MERGE (fn:Function {id: r.id})
+                    SET fn.name = r.name, fn.file_path = r.file_path,
+                        fn.start_line = r.start_line, fn.end_line = r.end_line,
+                        fn.signature = r.signature, fn.docstring = r.docstring,
+                        fn.qualified_name = r.qualified_name, fn.calls = r.calls,
+                        fn.updated_at = datetime()
+                """, rows=functions_data)
+
+            if classes_data:
+                db.run_query(session, """
+                    UNWIND $rows AS r
+                    MERGE (c:Class {id: r.id})
+                    SET c.name = r.name, c.file_path = r.file_path,
+                        c.start_line = r.start_line, c.end_line = r.end_line,
+                        c.docstring = r.docstring, c.qualified_name = r.qualified_name,
+                        c.updated_at = datetime()
+                """, rows=classes_data)
+
+            if tests_data:
+                db.run_query(session, """
+                    UNWIND $rows AS r
+                    MERGE (t:Test {id: r.id})
+                    SET t.name = r.name, t.file_path = r.file_path, t.updated_at = datetime()
+                """, rows=tests_data)
+
+            if contains_data:
+                db.run_query(session, """
+                    UNWIND $rows AS r
+                    MATCH (f:File {path: r.file_path})
+                    MATCH (n {id: r.node_id})
+                    MERGE (f)-[:CONTAINS]->(n)
+                """, rows=contains_data)
+
+            if resolved_calls:
+                db.run_query(session, """
+                    UNWIND $rows AS r
+                    MATCH (caller:Function {id: r.caller_id})
+                    MATCH (callee:Function {id: r.callee_id})
+                    MERGE (caller)-[:CALLS]->(callee)
+                """, rows=resolved_calls)
+
+            if resolved_imports:
+                db.run_query(session, """
+                    UNWIND $rows AS r
+                    MATCH (importer:File {path: r.importer})
+                    MATCH (imported:File {path: r.imported})
+                    MERGE (importer)-[:IMPORTS]->(imported)
+                """, rows=resolved_imports)
+
+            if resolved_inherits:
+                db.run_query(session, """
+                    UNWIND $rows AS r
+                    MATCH (child:Class {id: r.class_id})
+                    MATCH (parent:Class {id: r.parent_id})
+                    MERGE (child)-[:INHERITS]->(parent)
+                """, rows=resolved_inherits)
+
+    edges = len(contains_data) + len(resolved_calls) + len(resolved_imports) + len(resolved_inherits)
     return {
         "files": len(files_data),
         "functions": len(functions_data),
@@ -408,3 +464,119 @@ def _persist_to_graph(file_infos: List[FileInfo], repo_path: Path, db: GraphDB) 
         "tests": len(tests_data),
         "edges": edges,
     }
+
+
+# ------------------------------------------------------------------
+# Python-side edge resolution (replaces O(n²) Cypher cross-products)
+# ------------------------------------------------------------------
+
+def _resolve_calls(
+    calls_data: List[Dict],
+    functions_data: List[Dict],
+) -> List[Dict]:
+    """Resolve callee names to callee IDs using Python dict lookups.
+
+    Replaces the O(calls × functions) Cypher cross-product with
+    O(calls + functions) dict construction + O(1) lookups.
+    """
+    # Build lookup: bare name → set of function IDs
+    by_name: Dict[str, Set[str]] = defaultdict(set)
+    # Build lookup: qualified name suffix → set of function IDs
+    by_qsuffix: Dict[str, Set[str]] = defaultdict(set)
+
+    for fn in functions_data:
+        fn_id = fn["id"]
+        by_name[fn["name"]].add(fn_id)
+        qname = fn.get("qualified_name", "")
+        if qname:
+            parts = qname.split(".")
+            # Index all proper suffixes (after a dot boundary)
+            for i in range(1, len(parts)):
+                suffix = ".".join(parts[i:])
+                by_qsuffix[suffix].add(fn_id)
+
+    resolved = []
+    seen: Set[Tuple[str, str]] = set()
+
+    for call in calls_data:
+        caller_id = call["caller_id"]
+        callee_name = call["callee_name"]
+
+        # Match: callee.name = callee_name
+        callee_ids = set(by_name.get(callee_name, set()))
+        # Match: callee.qualified_name ENDS WITH ('.' + callee_name)
+        callee_ids.update(by_qsuffix.get(callee_name, set()))
+
+        for callee_id in callee_ids:
+            key = (caller_id, callee_id)
+            if key not in seen:
+                seen.add(key)
+                resolved.append({"caller_id": caller_id, "callee_id": callee_id})
+
+    return resolved
+
+
+def _resolve_imports(
+    imports_data: List[Dict],
+    files_data: List[Dict],
+) -> List[Dict]:
+    """Resolve import module names to file paths using Python dict lookups.
+
+    Replaces the O(imports × files) Cypher scan with string manipulation
+    with O(imports + files) dict construction + O(1) lookups.
+    """
+    # Build lookup: module suffix → set of file paths
+    # "foo/bar/baz.py" → module "foo.bar.baz" → suffixes: "baz", "bar.baz", "foo.bar.baz"
+    suffix_to_paths: Dict[str, Set[str]] = defaultdict(set)
+
+    for f in files_data:
+        path = f["path"]
+        module = path.replace("/", ".").replace("\\", ".")
+        if module.endswith(".py"):
+            module = module[:-3]
+        parts = module.split(".")
+        for i in range(len(parts)):
+            suffix = ".".join(parts[i:])
+            suffix_to_paths[suffix].add(path)
+
+    resolved = []
+    seen: Set[Tuple[str, str]] = set()
+
+    for imp in imports_data:
+        importer = imp["importer"]
+        imported_module = imp["imported_module"]
+
+        for target_path in suffix_to_paths.get(imported_module, set()):
+            if target_path == importer:
+                continue  # Skip self-imports
+            key = (importer, target_path)
+            if key not in seen:
+                seen.add(key)
+                resolved.append({"importer": importer, "imported": target_path})
+
+    return resolved
+
+
+def _resolve_inherits(
+    inherits_data: List[Dict],
+    classes_data: List[Dict],
+) -> List[Dict]:
+    """Resolve base class names to class IDs using Python dict lookups."""
+    by_name: Dict[str, List[str]] = defaultdict(list)
+    for cls in classes_data:
+        by_name[cls["name"]].append(cls["id"])
+
+    resolved = []
+    seen: Set[Tuple[str, str]] = set()
+
+    for inh in inherits_data:
+        class_id = inh["class_id"]
+        for parent_id in by_name.get(inh["base_name"], []):
+            if parent_id == class_id:
+                continue  # Skip self-inheritance
+            key = (class_id, parent_id)
+            if key not in seen:
+                seen.add(key)
+                resolved.append({"class_id": class_id, "parent_id": parent_id})
+
+    return resolved
