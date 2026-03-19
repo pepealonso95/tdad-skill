@@ -7,7 +7,7 @@ exactly which tests are impacted by code changes. When integrated into an
 AI agent's workflow, it enforces regression checking before patch submission.
 
 Evaluated on SWE-bench Verified (100 instances), GraphRAG-based test impact
-analysis **reduced AI-introduced regressions by 72%** compared to a vanilla
+analysis **reduced AI-introduced regressions by 70%** compared to a vanilla
 baseline, bringing the test-level regression rate down from 6.08% to 1.82%.
 
 ## Quick Start
@@ -205,6 +205,8 @@ pytest tests/
 # Start Neo4j for integration tests
 docker compose up -d
 ```
+
+Read the full paper and experimental details in the [TDAD paper](https://arxiv.org/abs/2603.17973).
 
 ## License
 
