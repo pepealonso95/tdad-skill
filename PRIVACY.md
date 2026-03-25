@@ -32,4 +32,4 @@ https://github.com/pepealonso95/tdad-skill
 ## Contact
 
 If you have questions about this privacy policy, contact:
-Rafael Alonso — pepealonso95@gmail.com
+Pepe Alonso — pepe@berkeley.edu
