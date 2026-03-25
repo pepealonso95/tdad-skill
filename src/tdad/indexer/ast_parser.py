@@ -48,6 +48,7 @@ class FileInfo:
     relative_path: str
     name: str
     content_hash: str
+    language: str = "python"
     imports: List[str] = field(default_factory=list)
     functions: List[FunctionInfo] = field(default_factory=list)
     classes: List[ClassInfo] = field(default_factory=list)

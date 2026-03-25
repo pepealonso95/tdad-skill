@@ -21,6 +21,9 @@ class TDADSettings(BaseSettings):
     use_coverage: bool = False
     coverage_threshold: float = 0.1
 
+    # Languages (comma-separated, e.g., "python,javascript"; empty = auto-detect)
+    languages: str = ""
+
     # Performance
     index_workers: int = 4
     query_timeout: float = 20.0

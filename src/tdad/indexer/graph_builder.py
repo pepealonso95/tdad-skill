@@ -1,36 +1,43 @@
-"""Graph builder: walks a repo, parses Python files, persists to graph DB."""
+"""Graph builder: walks a repo, parses source files, persists to graph DB."""
 
 import hashlib
 import logging
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .ast_parser import FileInfo, parse_file
+from .ast_parser import FileInfo as AstFileInfo, parse_file as ast_parse_file
+from ..languages import get_active_plugins, all_extensions, SKIP_DIRS
+from ..languages.base import LanguagePlugin, FileInfo
 
 logger = logging.getLogger(__name__)
 
-SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".tox", ".eggs", "dist", "build"}
 
-
-def _collect_python_files(repo_path: Path) -> List[Path]:
-    """Walk repo for .py files, skipping common non-source directories."""
+def _collect_source_files(repo_path: Path, extensions: Set[str]) -> List[Path]:
+    """Walk repo for source files matching the given extensions."""
     files = []
-    for p in repo_path.rglob("*.py"):
+    for p in repo_path.rglob("*"):
         if any(part in SKIP_DIRS for part in p.parts):
             continue
-        files.append(p)
+        if p.is_file() and p.suffix in extensions:
+            files.append(p)
     return sorted(files)
 
 
-def _parse_file_worker(file_path_str: str, repo_root_str: str) -> FileInfo:
-    """Standalone worker function for ProcessPoolExecutor."""
-    return parse_file(Path(file_path_str), Path(repo_root_str))
+# Keep for backward compatibility
+def _collect_python_files(repo_path: Path) -> List[Path]:
+    """Walk repo for .py files, skipping common non-source directories."""
+    return _collect_source_files(repo_path, {".py"})
+
+
+def _parse_file_worker(file_path_str: str, repo_root_str: str) -> AstFileInfo:
+    """Standalone worker function for ProcessPoolExecutor (Python only)."""
+    return ast_parse_file(Path(file_path_str), Path(repo_root_str))
 
 
 def _module_name(relative_path: str) -> str:
-    """Convert repo-relative path to dotted module name."""
+    """Convert repo-relative path to dotted module name (Python convention)."""
     normalized = relative_path.replace("\\", "/")
     if normalized.endswith(".py"):
         normalized = normalized[:-3]
@@ -141,11 +148,20 @@ def _delete_stale_nodes(db, changed_rel_paths: List[str]) -> None:
 # Public API
 # ------------------------------------------------------------------
 
-def build_graph(repo_path: Path, db, force: bool = False) -> Dict[str, Any]:
-    """Index a repository into the Neo4j graph.
+def build_graph(
+    repo_path: Path,
+    db,
+    force: bool = False,
+    languages: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Index a repository into the graph.
 
     Incremental by default: only re-parses new/changed files and removes
     deleted ones. Use force=True for a full rebuild.
+
+    Args:
+        languages: Comma-separated language names (e.g., "python,javascript").
+                   If None, auto-detects from file extensions.
 
     Returns statistics dict with node/edge counts.
     """
@@ -158,7 +174,11 @@ def build_graph(repo_path: Path, db, force: bool = False) -> Dict[str, Any]:
 
     db.ensure_schema()
 
-    python_files = _collect_python_files(repo_path)
+    # Resolve active language plugins
+    plugins = get_active_plugins(repo_path, explicit_languages=languages)
+    extensions = all_extensions(plugins)
+
+    python_files = _collect_source_files(repo_path, extensions)
     if not python_files:
         return {"files": 0, "functions": 0, "classes": 0, "tests": 0, "edges": 0,
                 "incremental": False, "changed": 0, "unchanged": 0, "deleted": 0}
@@ -199,10 +219,10 @@ def build_graph(repo_path: Path, db, force: bool = False) -> Dict[str, Any]:
 
     # Parse files (parallel when > 1 worker)
     workers = min(db.settings.index_workers, len(to_parse))
-    file_infos = _parse_files(to_parse, repo_path, workers)
+    file_infos = _parse_files(to_parse, repo_path, workers, plugins)
 
     # Persist nodes and edges
-    stats = _persist_to_graph(file_infos, repo_path, db)
+    stats = _persist_to_graph(file_infos, repo_path, db, plugins)
     stats["incremental"] = bool(indexed)
     stats["changed"] = len(to_parse)
     stats["unchanged"] = len(unchanged)
@@ -217,32 +237,133 @@ def build_graph(repo_path: Path, db, force: bool = False) -> Dict[str, Any]:
     return stats
 
 
-def _parse_files(python_files: List[Path], repo_path: Path, workers: int) -> List[FileInfo]:
-    if workers <= 1:
-        results = []
-        for f in python_files:
-            try:
-                results.append(parse_file(f, repo_path))
-            except Exception as exc:
-                logger.error("Error parsing %s: %s", f, exc)
-        return results
+def _get_plugin_for_file(path: Path, plugins: List[LanguagePlugin]) -> Optional[LanguagePlugin]:
+    """Find the plugin that handles the given file's extension."""
+    suffix = path.suffix.lower()
+    for plugin in plugins:
+        if suffix in plugin.file_extensions:
+            return plugin
+    return None
 
-    results = []
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(_parse_file_worker, str(f), str(repo_path)): f
-            for f in python_files
-        }
-        for future in as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception as exc:
-                logger.error("Error parsing %s: %s", futures[future], exc)
+
+def _parse_files(
+    source_files: List[Path],
+    repo_path: Path,
+    workers: int,
+    plugins: Optional[List[LanguagePlugin]] = None,
+) -> List[FileInfo]:
+    if plugins is None:
+        plugins = get_active_plugins(repo_path)
+
+    # Separate Python files (can use ProcessPoolExecutor) from others
+    python_files = [f for f in source_files if f.suffix == ".py"]
+    other_files = [f for f in source_files if f.suffix != ".py"]
+
+    results: List[FileInfo] = []
+
+    # Parse Python files (parallel-capable via ProcessPoolExecutor)
+    if python_files:
+        python_plugin = None
+        for p in plugins:
+            if p.name == "python":
+                python_plugin = p
+                break
+
+        if python_plugin and workers > 1:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_parse_file_worker, str(f), str(repo_path)): f
+                    for f in python_files
+                }
+                for future in as_completed(futures):
+                    try:
+                        ast_info = future.result()
+                        # Convert ast_parser FileInfo to languages.base FileInfo
+                        results.append(_convert_ast_fileinfo(ast_info))
+                    except Exception as exc:
+                        logger.error("Error parsing %s: %s", futures[future], exc)
+        else:
+            for f in python_files:
+                try:
+                    if python_plugin:
+                        results.append(python_plugin.parse_file(f, repo_path))
+                    else:
+                        results.append(_convert_ast_fileinfo(ast_parse_file(f, repo_path)))
+                except Exception as exc:
+                    logger.error("Error parsing %s: %s", f, exc)
+
+    # Parse non-Python files via their language plugins (single-threaded)
+    for f in other_files:
+        plugin = _get_plugin_for_file(f, plugins)
+        if plugin is None:
+            continue
+        try:
+            results.append(plugin.parse_file(f, repo_path))
+        except Exception as exc:
+            logger.error("Error parsing %s: %s", f, exc)
+
     return results
 
 
-def _persist_to_graph(file_infos: List[FileInfo], repo_path: Path, db) -> Dict[str, int]:
+def _convert_ast_fileinfo(info: AstFileInfo) -> FileInfo:
+    """Convert an ast_parser.FileInfo to a languages.base.FileInfo."""
+    from ..languages.base import FunctionInfo as BaseFunctionInfo, ClassInfo as BaseClassInfo
+    functions = [
+        BaseFunctionInfo(
+            name=f.name, file_path=f.file_path,
+            start_line=f.start_line, end_line=f.end_line,
+            signature=f.signature, docstring=f.docstring,
+            calls=f.calls, is_test=f.is_test,
+        )
+        for f in info.functions
+    ]
+    classes = [
+        BaseClassInfo(
+            name=c.name, file_path=c.file_path,
+            start_line=c.start_line, end_line=c.end_line,
+            docstring=c.docstring,
+            methods=[
+                BaseFunctionInfo(
+                    name=m.name, file_path=m.file_path,
+                    start_line=m.start_line, end_line=m.end_line,
+                    signature=m.signature, docstring=m.docstring,
+                    calls=m.calls, is_test=m.is_test,
+                )
+                for m in c.methods
+            ],
+            bases=c.bases,
+        )
+        for c in info.classes
+    ]
+    return FileInfo(
+        path=info.path,
+        relative_path=info.relative_path,
+        name=info.name,
+        content_hash=info.content_hash,
+        language=getattr(info, "language", "python"),
+        imports=info.imports,
+        functions=functions,
+        classes=classes,
+        is_test_file=info.is_test_file,
+    )
+
+
+def _persist_to_graph(
+    file_infos: List[FileInfo],
+    repo_path: Path,
+    db,
+    plugins: Optional[List[LanguagePlugin]] = None,
+) -> Dict[str, int]:
     """Persist parsed file info to graph DB."""
+    if plugins is None:
+        plugins = get_active_plugins(repo_path)
+
+    # Build extension -> plugin map for quick lookup
+    ext_to_plugin: Dict[str, LanguagePlugin] = {}
+    for plugin in plugins:
+        for ext in plugin.file_extensions:
+            ext_to_plugin[ext] = plugin
+
     files_data = []
     functions_data = []
     classes_data = []
@@ -253,12 +374,20 @@ def _persist_to_graph(file_infos: List[FileInfo], repo_path: Path, db) -> Dict[s
     inherits_data = []
 
     for fi in file_infos:
-        mod = _module_name(fi.relative_path)
+        # Find the plugin for this file's language
+        suffix = Path(fi.name).suffix.lower()
+        plugin = ext_to_plugin.get(suffix)
+        if plugin:
+            mod = plugin.module_name(fi.relative_path)
+        else:
+            mod = _module_name(fi.relative_path)
+
         files_data.append({
             "path": fi.relative_path,
             "name": fi.name,
             "content_hash": fi.content_hash,
             "repo_path": str(repo_path),
+            "language": fi.language,
         })
 
         for func in fi.functions:
@@ -307,11 +436,12 @@ def _persist_to_graph(file_infos: List[FileInfo], repo_path: Path, db) -> Dict[s
             for method in cls.methods:
                 method_id = f"{fi.relative_path}::{cls.name}.{method.name}:{method.start_line}"
 
-                # Resolve self./cls. references to ClassName.method for
-                # accurate CALLS edge matching and test linking.
+                # Resolve self/cls/this references via the language plugin
                 resolved_calls = []
                 for call in method.calls:
-                    if call.startswith("self.") or call.startswith("cls."):
+                    if plugin:
+                        resolved_calls.append(plugin.resolve_self_calls(cls.name, call))
+                    elif call.startswith("self.") or call.startswith("cls."):
                         resolved_calls.append(f"{cls.name}.{call.split('.', 1)[1]}")
                     else:
                         resolved_calls.append(call)

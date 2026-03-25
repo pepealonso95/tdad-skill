@@ -7,7 +7,7 @@ import logging
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ..core.graph_db import GraphDB
 
@@ -133,7 +133,15 @@ def _select_tiered(tests: List[Dict], max_tests: int) -> List[Dict]:
 # Path normalization
 # ------------------------------------------------------------------
 
-def _normalize_paths(repo_path: Path, changed_files: List[str]) -> List[str]:
+def _normalize_paths(
+    repo_path: Path,
+    changed_files: List[str],
+    extensions: Optional[Set[str]] = None,
+) -> List[str]:
+    if extensions is None:
+        from ..languages import get_active_plugins, all_extensions
+        extensions = all_extensions(get_active_plugins(repo_path))
+
     repo_root = repo_path.resolve()
     normalized = []
     seen: Set[str] = set()
@@ -148,7 +156,7 @@ def _normalize_paths(repo_path: Path, changed_files: List[str]) -> List[str]:
                 continue
         else:
             rel = str(p)
-        if not rel.endswith(".py"):
+        if not any(rel.endswith(ext) for ext in extensions):
             continue
         if rel not in seen:
             seen.add(rel)
@@ -378,55 +386,77 @@ def _find_by_prefix(
 def _add_heuristic_mappings(repo_dir: Path, mapping: Dict[str, Set[str]]) -> None:
     """Supplement mapping with filename-convention-based test links.
 
-    Matches: test_foo.py <-> foo.py, foo_test.py <-> foo.py
-    When a stem is ambiguous (3+ source files), uses directory proximity
-    to select the best match instead of mapping all candidates.
+    Uses language plugins to determine test file patterns and stem mappings.
+    Falls back to Python conventions when no plugins are available.
     """
+    from ..languages import get_active_plugins, all_extensions, SKIP_DIRS
+
     repo = repo_dir.resolve()
+    plugins = get_active_plugins(repo_dir)
+    extensions = all_extensions(plugins)
+
     source_by_stem: Dict[str, List[str]] = defaultdict(list)
     test_files: List[str] = []
 
-    for py in repo.rglob("*.py"):
-        parts = py.relative_to(repo).parts
-        if any(p.startswith('.') or p == '__pycache__' for p in parts):
+    for f in repo.rglob("*"):
+        if any(part in SKIP_DIRS for part in f.parts):
             continue
-        rel = str(py.relative_to(repo))
-        stem = py.stem
-        if stem.startswith("test_") or stem.endswith("_test") or stem == "tests":
+        if not f.is_file() or f.suffix not in extensions:
+            continue
+        parts = f.relative_to(repo).parts
+        if any(p.startswith('.') for p in parts):
+            continue
+        rel = str(f.relative_to(repo))
+
+        # Check if this is a test file using any plugin
+        is_test = False
+        for plugin in plugins:
+            if f.suffix in plugin.file_extensions and plugin.is_test_file(f.name):
+                is_test = True
+                break
+
+        stem = f.stem
+        if is_test:
             test_files.append(rel)
         elif stem not in ("__init__", "conftest"):
             source_by_stem[stem].append(rel)
 
     for tf in test_files:
         stem = Path(tf).stem
-        if stem.startswith("test_"):
-            target = stem[5:]
-        elif stem.endswith("_test"):
-            target = stem[:-5]
-        elif stem == "tests":
-            # tests.py — map to source files in nearest non-test ancestor
-            # e.g., tests/auth/tests.py → source files whose path contains "auth"
-            _map_tests_py_by_proximity(tf, source_by_stem, mapping)
-            continue
-        else:
-            continue
+        suffix = Path(tf).suffix
+
+        # Use the appropriate plugin to get the target source stem
+        target = None
+        for plugin in plugins:
+            if suffix in plugin.file_extensions:
+                target = plugin.heuristic_test_stem(stem)
+                break
+
+        if target is None:
+            # Fallback: try Python conventions
+            if stem.startswith("test_"):
+                target = stem[5:]
+            elif stem.endswith("_test"):
+                target = stem[:-5]
+            elif stem == "tests":
+                _map_tests_py_by_proximity(tf, source_by_stem, mapping)
+                continue
+            else:
+                continue
+
         candidates = source_by_stem.get(target, [])
         if not candidates:
             # Try underscore-prefixed variant: test_forest.py → _forest.py
-            # Common in scikit-learn, matplotlib, and other scientific Python repos
             candidates = source_by_stem.get(f"_{target}", [])
         if not candidates:
             # Prefix fallback: test_query_aggregation.py → query.py
-            # Try progressively shorter prefixes by splitting on '_'
             candidates = _find_by_prefix(target, tf, source_by_stem)
         if not candidates:
             continue
         if len(candidates) <= 2:
-            # Unambiguous — map all
             for src in candidates:
                 mapping[src].add(tf)
         else:
-            # Ambiguous stem — use directory proximity to pick best match
             scored = [(src, _path_similarity(tf, src)) for src in candidates]
             scored.sort(key=lambda x: -x[1])
             best_score = scored[0][1]

@@ -16,6 +16,8 @@ def main(argv=None):
     p_index = sub.add_parser("index", help="Index a repository into the code-test graph")
     p_index.add_argument("repo_path", type=Path, help="Path to repository")
     p_index.add_argument("--force", action="store_true", help="Force full rebuild")
+    p_index.add_argument("--languages", type=str, default=None,
+                         help="Comma-separated languages (e.g., python,javascript). Auto-detects if omitted.")
 
     # -- impact --
     p_impact = sub.add_parser("impact", help="Find tests impacted by changed files")
@@ -23,6 +25,8 @@ def main(argv=None):
     p_impact.add_argument("--files", nargs="+", required=True, help="Changed file paths")
     p_impact.add_argument("--strategy", default="balanced", choices=["conservative", "balanced", "aggressive"])
     p_impact.add_argument("--max-tests", type=int, default=50)
+    p_impact.add_argument("--languages", type=str, default=None,
+                         help="Comma-separated languages (e.g., python,javascript). Auto-detects if omitted.")
 
     # -- run-tests --
     p_run = sub.add_parser("run-tests", help="Run specific tests via pytest")
@@ -64,11 +68,12 @@ def _cmd_index(args):
     from .analyzer.impact import export_test_map, export_test_map_heuristic
 
     settings = get_settings()
+    languages = getattr(args, "languages", None) or settings.languages or None
 
     try:
         with get_db(settings, repo_path=args.repo_path) as db:
             print(f"Indexing {args.repo_path} (backend={settings.backend}) ...")
-            stats = build_graph(args.repo_path, db, force=args.force)
+            stats = build_graph(args.repo_path, db, force=args.force, languages=languages)
             if stats.get("incremental"):
                 print(f"  Changed:   {stats.get('changed', 0)}")
                 print(f"  Unchanged: {stats.get('unchanged', 0)}")

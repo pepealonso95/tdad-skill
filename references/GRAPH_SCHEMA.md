@@ -3,13 +3,14 @@
 ## Node Types
 
 ### File
-Represents a Python source file.
+Represents a source file (Python, JavaScript, TypeScript, Go, Java, Rust, Dart).
 
 | Property | Type | Description |
 |----------|------|-------------|
 | `path` | string (unique) | Repo-relative file path |
 | `name` | string | Filename |
 | `content_hash` | string | MD5 of file content |
+| `language` | string | Language identifier (e.g., `python`, `javascript`) |
 | `repo_path` | string | Absolute repo root path |
 | `updated_at` | datetime | Last index time |
 

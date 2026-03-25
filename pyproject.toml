@@ -33,6 +33,24 @@ dependencies = [
 [project.optional-dependencies]
 neo4j = ["neo4j>=5.14.0"]
 coverage = ["coverage>=7.0.0"]
+treesitter = [
+    "tree-sitter>=0.23",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+]
+treesitter-go = ["tree-sitter>=0.23", "tree-sitter-go"]
+treesitter-java = ["tree-sitter>=0.23", "tree-sitter-java"]
+treesitter-rust = ["tree-sitter>=0.23", "tree-sitter-rust"]
+treesitter-dart = ["tree-sitter>=0.23", "tree-sitter-dart-orchard"]
+treesitter-all = [
+    "tree-sitter>=0.23",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+    "tree-sitter-go",
+    "tree-sitter-java",
+    "tree-sitter-rust",
+    "tree-sitter-dart-orchard",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-mock>=3.0.0",
@@ -43,6 +61,9 @@ tdad = "tdad.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tdad"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/tdad/languages/queries" = "tdad/languages/queries"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

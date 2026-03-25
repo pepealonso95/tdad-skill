@@ -7,6 +7,10 @@ insight: AI agents are good at generating code but bad at preserving existing
 behavior. By making tests the primary feedback signal, we constrain the agent
 to produce changes that don't break things.
 
+TDAD supports Python, JavaScript/TypeScript, Go, Java, Rust, and Dart.
+Languages are auto-detected from file extensions. The graph schema is
+language-agnostic — all languages produce the same node and edge types.
+
 ## The 8-Phase Workflow
 
 ### Phase 1: Understand
